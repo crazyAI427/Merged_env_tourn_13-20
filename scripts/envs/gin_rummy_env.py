@@ -15,7 +15,7 @@ from envs.shared_env import (
     GAMES_TO_TASK_ID_RANGE,
     CurriculumScheduler,
     init_env_pool,
-    rollout_reward_func,  # re-exported for callers
+    rollout_reward_func,
 )
 
 
@@ -315,7 +315,7 @@ def _ensure_initialized(trainer) -> None:
         "task_id": GAMES_TO_TASK_ID_RANGE[_SELECTED_GAME][0],
         "seed": 42,
         "opponent": "mcts",
-        "mcts_max_simulations": 50,
+        "mcts_max_simulations": 25,
         "mcts_num_rollouts": 1,
     }
     rank, env_pool, num_servers, thread_pool, generation_semaphore = init_env_pool(reset_payload)
@@ -419,7 +419,7 @@ def _run_episode(
     # --- Reset environment ---
     reset_payload = {
         "task_id": game_id, "seed": game_id,
-        "opponent": "mcts", "mcts_max_simulations": 50, "mcts_num_rollouts": 1,
+        "opponent": "mcts", "mcts_max_simulations": 25, "mcts_num_rollouts": 1,
     }
     try:
         reset_res = requests.post(f"{env_endpoint}/reset", json=reset_payload, timeout=_TIMEOUT)
