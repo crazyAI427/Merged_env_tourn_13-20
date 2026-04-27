@@ -25,21 +25,21 @@ _MAX_EPISODE_TOKENS = 16384   # max tokens per full-prompt episode (16k context)
 _MAX_PROMPT_LEN     = 5000    # prompt token cap — 5k tokens (LD obs shorter than GR)
 _TIMEOUT            = 2400    # HTTP timeout (seconds) — 40 min covers slow MCTS reset
 
-# Risky-move bonus parameters
+# Risky-move tracking thresholds (used for bluff/risky-liar counting, not reward)
 BLUFF_PROB_THRESHOLD  = 0.35   # below this = model is bluffing (unlikely bid)
 RISKY_LIAR_PROB_MIN   = 0.35   # liar call in [0.35, 0.60] = risky-but-correct zone
 RISKY_LIAR_PROB_MAX   = 0.60
-BLUFF_WIN_BONUS       = 0.5    # bonus for winning after calling a bluff
-RISKY_LIAR_WIN_BONUS  = 0.5    # bonus for winning after risky liar call
 RISKY_BONUS_MAX_COUNT = 2      # cap: max 2 bluff/risky events per episode credited
 SHUFFLE_PROB          = 0.5    # probability of shuffling displayed action order each turn
-NORMALIZE_REWARDS     = False  # disable reward normalization (raw discounted return)
 
-# Bayesian-informed bonus/penalty (supplements existing score-based rewards)
-BAYES_GOOD_CALL_BONUS   =  0.15  # call liar when Bayesian says bid unlikely (P<35%)
-BAYES_BAD_CALL_PENALTY  = -0.10  # call liar when Bayesian says bid plausible (P>70%)
-BAYES_GOOD_BID_BONUS    =  0.05  # bid well-supported by Bayesian estimate
-BAYES_OVERREACH_PENALTY = -0.05  # bid far exceeding Bayesian estimate (+2 over expected)
+# Episode-level reward constants (clipped to [-1, 1])
+TERMINAL_WIN_REWARD   = 1.0
+TERMINAL_LOSS_REWARD  = -1.0
+BLUFF_WIN_BONUS       = 0.15   # small bonus for winning with bluffs
+RISKY_LIAR_WIN_BONUS  = 0.15   # small bonus for winning with risky liar calls
+INVALID_PENALTY       = -0.1   # per-step penalty for invalid actions
+INVALID_TOTAL_CLIP    = -0.3   # floor for accumulated invalid penalties
+TERMINAL_REWARD_CLIP  = 1.0    # hard clip for final episode reward
 
 
 # GAME STATE AND PROBABILITY HELPERS FOR LIAR'S DICE
@@ -286,67 +286,46 @@ class BayesianOpponentInference:
 # REWARD CALCULATOR FOR LIAR'S DICE
 
 class RewardCalculator:
-    """Shaped reward calculator for Liar's Dice with Bayesian opponent awareness."""
+    """
+    Episode-level reward for Liar's Dice.
+    Sparse step penalties (invalid only) + terminal win/loss + strategic bonuses.
+    Clipped to [-1, 1].
+    """
 
-    def __init__(self, gamma: float = 0.9):
-        self.terminal_weight = 10.0   # scale for terminal env reward
-        self.gamma           = gamma  # 0.9 discount factor for short LD episodes
+    def __init__(self):
+        self.invalid_penalty = INVALID_PENALTY
 
     def calculate_step_reward(
         self,
         action: "Action | None",
         env_reward: float,
-        *,
-        bayes: "BayesianOpponentInference | None" = None,
-        gs: "GameState | None" = None,
+        is_invalid: bool = False,
     ) -> float:
-        """Per-step shaped reward: base score + Bayesian adjustments."""
-        reward = 0.0
-        if action is not None:
-            reward += action.score
+        if is_invalid:
+            return self.invalid_penalty
+        return 0.0
 
-            if bayes is not None and bayes._bids_observed > 0 and gs is not None:
-                if action.is_liar and gs.current_bid is not None:
-                    own_support = bayes._own_dice_support(gs.our_dice, gs.current_bid.face)
-                    p_true      = bayes.bid_posterior_prob(gs.current_bid, own_support)
-                    if p_true < 0.35:
-                        reward += BAYES_GOOD_CALL_BONUS    # Bayesian says bid likely false → good call
-                    elif p_true > 0.70:
-                        reward += BAYES_BAD_CALL_PENALTY   # Bayesian says bid likely true → bad call
-
-                elif action.bid is not None:
-                    exp_support   = bayes.expected_support(action.bid.face)
-                    own_support   = bayes._own_dice_support(gs.our_dice, action.bid.face)
-                    total_expected = own_support + exp_support
-                    if action.bid.quantity <= total_expected + 0.5:
-                        reward += BAYES_GOOD_BID_BONUS      # bid well-supported
-                    elif action.bid.quantity > total_expected + 2.0:
-                        reward += BAYES_OVERREACH_PENALTY   # bid far exceeds estimate
-
-        if env_reward != 0.0:
-            reward += env_reward * self.terminal_weight  # ×10 terminal scale
-
-        return reward
-
-    def calculate_discounted_return(
+    def calculate_episode_reward(
         self,
-        rewards: list[float],
-        step_scores: "list[float] | None" = None,
-        terminal_reward: float = 0.0,
+        step_rewards: list[float],
+        env_reward: float,
+        done: bool,
+        bluff_count: int = 0,
+        risky_liar_count: int = 0,
     ) -> float:
-        """Compute the training return."""
-        if not NORMALIZE_REWARDS:
-            if not rewards:
-                return 0.0
-            T = len(rewards)
-            return sum(self.gamma ** (T - 1 - i) * r for i, r in enumerate(rewards))
+        terminal = 0.0
+        if done:
+            if env_reward > 0.5:
+                terminal = TERMINAL_WIN_REWARD
+                terminal += BLUFF_WIN_BONUS * min(bluff_count, RISKY_BONUS_MAX_COUNT)
+                terminal += RISKY_LIAR_WIN_BONUS * min(risky_liar_count, RISKY_BONUS_MAX_COUNT)
+            else:
+                terminal = TERMINAL_LOSS_REWARD
 
-        scores = step_scores if step_scores is not None else []
-        if not scores:
-            return terminal_reward
-        T = len(scores)
-        discounted_sum = sum(self.gamma ** (T - 1 - i) * s for i, s in enumerate(scores))
-        return discounted_sum / T + terminal_reward
+        invalid_total = max(sum(r for r in step_rewards if r < 0), INVALID_TOTAL_CLIP)
+
+        raw = terminal + invalid_total
+        return max(min(raw, TERMINAL_REWARD_CLIP), -TERMINAL_REWARD_CLIP)
 
 
 # MODULE STATE AND INITIALIZATION FOR LIAR'S DICE
@@ -458,8 +437,6 @@ def _run_episode(
     turn_number    = 0
     game_state_history: list[GameState] = []
     rewards:      list[float] = []
-    step_scores:  list[float] = []
-    terminal_reward: float    = 0.0
     calculator     = RewardCalculator()
     bluff_count      = 0
     risky_liar_count = 0
@@ -637,7 +614,7 @@ def _run_episode(
                 action_id  = int(action_to_send.strip())
             except Exception as exc:
                 print(f"Failed to parse game state or action id: {exc}")
-                immediate_reward = -1.0
+                immediate_reward = calculator.calculate_step_reward(None, 0.0, is_invalid=True)
             else:
                 taken_action     = next(
                     (a for a in previous_game_state.actions if a.action_id == action_id), None
@@ -666,25 +643,10 @@ def _run_episode(
 
                 if not done:
                     game_state_history.append(game_state)
-                    immediate_reward = calculator.calculate_step_reward(
-                        taken_action, 0.0,
-                        bayes=bayes, gs=previous_game_state,
-                    )
-                    step_scores.append(taken_action.score if taken_action else 0.0)
-                else:
-                    won              = step_reward > 0.5
-                    immediate_reward = (taken_action.score if taken_action else 0.0)
-                    immediate_reward += (step_reward - 0.5) * 2.0
-                    step_scores.append(taken_action.score if taken_action else 0.0)
-                    terminal_reward  = (step_reward - 0.5) * 2.0
-                    if won:
-                        immediate_reward += BLUFF_WIN_BONUS     * min(bluff_count,      RISKY_BONUS_MAX_COUNT)
-                        immediate_reward += RISKY_LIAR_WIN_BONUS * min(risky_liar_count, RISKY_BONUS_MAX_COUNT)
-                        terminal_reward  += BLUFF_WIN_BONUS     * min(bluff_count,      RISKY_BONUS_MAX_COUNT)
-                        terminal_reward  += RISKY_LIAR_WIN_BONUS * min(risky_liar_count, RISKY_BONUS_MAX_COUNT)
+
+                immediate_reward = calculator.calculate_step_reward(taken_action, 0.0)
         else:
-            immediate_reward = -1.0
-            step_scores.append(-1.0)
+            immediate_reward = calculator.calculate_step_reward(None, 0.0, is_invalid=True)
 
         rewards.append(immediate_reward)
 
@@ -702,10 +664,10 @@ def _run_episode(
         turn_number += 1
 
     # --- Final reward ---
-    train_reward = calculator.calculate_discounted_return(
-        rewards,
-        step_scores=step_scores,
-        terminal_reward=terminal_reward,
+    train_reward = calculator.calculate_episode_reward(
+        rewards, final_reward, done,
+        bluff_count=bluff_count,
+        risky_liar_count=risky_liar_count,
     )
 
     print(
