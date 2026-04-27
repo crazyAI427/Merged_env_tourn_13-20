@@ -142,6 +142,7 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         rollout_last=_gin_rollout_last,
         reward_func=_gin_reward,
         curriculum_factory=_gin_curriculum,
+        num_generations=8,
         reasoning=ModeConfig(initial_max_turn=8),
         no_mask=ModeConfig(initial_max_turn=4, rollouts_per_stage=512),
         full_prompt=ModeConfig(initial_max_turn=8),

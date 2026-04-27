@@ -14,6 +14,7 @@ from envs.env_configs import get_env_config
 allow_find_lk_lr = False
 
 GRPO_CONFIG = {
+    #can ignore in env tourn
     "0_1_b": {
         "lr": 3e-5,
         "distributed": "ddp",
@@ -26,6 +27,7 @@ GRPO_CONFIG = {
         "initial_max_turn": 1,
         "rollouts_per_stage": 1280,
     },
+    #can ignore in env tourn
     "1_2_b": {
         "lr": 1e-5,
         "distributed": "ddp",
@@ -48,8 +50,20 @@ GRPO_CONFIG = {
         "beta": 0.01,
         "rollouts_per_stage": 1280,
     },
+    "2_4_b_qwen": {
+        "lr": 1e-4,
+        "distributed": "ddp",
+        "gpu_count": 2,
+        "batch_size": 2,
+        "gradient_accumulation_steps": 8,
+        "vllm_gpu_memory_utilization": 0.3,
+        "use_lora": True,
+        "beta": 0.01,
+        "rollouts_per_stage": 1280,
+    },
+    # only qwen3-4B-instruct-2507
     "4_5_b": {
-        "lr": 8e-6,
+        "lr": 1e-4,
         "distributed": "ddp",
         "gpu_count": 2,
         "batch_size": 2,
@@ -59,6 +73,7 @@ GRPO_CONFIG = {
         "beta": 0.01,
         "rollouts_per_stage": 1280,
     },
+    # can ignore in env tourn
     "5_6_b": {
         "lr": 8e-6,
         "distributed": "ddp",
@@ -71,7 +86,54 @@ GRPO_CONFIG = {
 
         "rollouts_per_stage": 1280,
     },
+    # codellama-7b
     "6_9_b": {
+        "lr": 8e-6,
+        "distributed": "ddp",
+        "gpu_count": 4,
+        "batch_size": 2,
+        "gradient_accumulation_steps": 4,
+        "use_lora": True,
+        "vllm_gpu_memory_utilization": 0.35,
+        "beta": 0.01,  
+        "rollouts_per_stage": 1024,  
+    },
+     # Qwen2-7B-Instruct: medium-high LR tolerance.
+    "6_9_b_qwen2": {
+        "lr": 1e-5,
+        "distributed": "ddp",
+        "gpu_count": 4,
+        "batch_size": 2,
+        "gradient_accumulation_steps": 8,
+        "use_lora": True,
+        "vllm_gpu_memory_utilization": 0.35,
+        "beta": 0.01,  
+        "rollouts_per_stage": 1024,  
+    },
+    "6_9_b_qwen2_5": {
+        "lr": 1.5e-5,
+        "distributed": "ddp",
+        "gpu_count": 4,
+        "batch_size": 2,
+        "gradient_accumulation_steps": 8,
+        "use_lora": True,
+        "vllm_gpu_memory_utilization": 0.35,
+        "beta": 0.01,  
+        "rollouts_per_stage": 1024,  
+    },
+    "6_9_b_mistral": {
+        "lr": 1e-5,
+        "distributed": "ddp",
+        "gpu_count": 4,
+        "batch_size": 2,
+        "gradient_accumulation_steps": 8,
+        "use_lora": True,
+        "vllm_gpu_memory_utilization": 0.35,
+        "beta": 0.01,  
+        "rollouts_per_stage": 1024,  
+    },
+
+    "6_9_b_mistral_effbs8": {
         "lr": 8e-6,
         "distributed": "ddp",
         "gpu_count": 4,
@@ -278,8 +340,14 @@ def get_training_json(train_info: dict) -> dict:
     model_architecture = get_model_architecture(model_path)
     param_nums = get_model_num_params(model_name, model_path)
     config = get_grpo_config(param_nums)
+    if model_name == "Qwen/Qwen2.5-3B-Instruct":
+        config = GRPO_CONFIG["2_4_b_qwen"]
+    if model_name == "Qwen/Qwen2-7B-Instruct":
+        config = GRPO_CONFIG["6_9_b_qwen2"]
+    if model_name == "Qwen/Qwen2.5-7B-Instruct":
+        config = GRPO_CONFIG["6_9_b_qwen2_5"]
     if model_name in ["mistralai/Mistral-7B-Instruct-v0.3", "mistralai/Mistral-7B-Instruct-v0.2"]:
-        config = GRPO_CONFIG["6_9_b"]
+        config = GRPO_CONFIG["6_9_b_mistral_effbs8"]
     print(f"config: {config}")
     run_config = {
         "epoch_num": 4,
