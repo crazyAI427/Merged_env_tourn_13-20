@@ -95,7 +95,7 @@ GRPO_CONFIG = {
         "gradient_accumulation_steps": 4,
         "use_lora": True,
         "vllm_gpu_memory_utilization": 0.35,
-        "beta": 0.01,  
+        "beta": 0.05,  
         "rollouts_per_stage": 1024,  
     },
      # Qwen2-7B-Instruct: medium-high LR tolerance.
