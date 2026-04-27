@@ -24,8 +24,8 @@ _MAX_EPISODE_TOKENS  = 16384  # max tokens per full-prompt episode (16k context 
 _MAX_PROMPT_LEN      = 4096   # prompt token cap — above this end early to prevent OOM
 _TIMEOUT             = 2400   # HTTP timeout (seconds) — 40 min covers slow MCTS reset
 _MCTS_SIMS           = 50     # fixed MCTS simulations — no progressive ramp for Leduc
-_INVALID_PENALTY     = -0.1   # base penalty per invalid/failed action
-_CONSEC_INVALID_ESC  =  0.05  # escalation per consecutive invalid (2nd=-0.15, 3rd=-0.20)
+_INVALID_PENALTY     = -0.1   # per-step penalty for invalid actions
+_INVALID_TOTAL_CLIP  = -0.3   # floor for accumulated invalid penalties
 _MAX_TURNS           = 10     # max turns per episode (Leduc is 4-8 actions; 10 = safe cap)
 
 # Debug flag — set True for verbose per-step logging during development.
@@ -229,197 +229,51 @@ def parse_game_state(obs: str) -> "GameState | None":
     )
 
 
-# HAND EQUITY ENGINE FOR LEDUC POKER
-# Derived from DeepStack-Leduc (lifrordi/DeepStack-Leduc):
-#   terminal_equity.lua: get_last_round_call_matrix  (rank comparison)
-#   terminal_equity.lua: _set_call_matrix             (R1 board averaging)
-#   card_tools.lua:      get_possible_hand_indexes    (board blocking)
-
-_EQUITY_REWARD_SCALE    = 0.4   # scale for DeepStack equity bonus; tune: [0.2, 0.8]
-_INTER_TURN_REWARD_SCALE = 0.15  # scale for inter-turn pot-commitment bonus; tune: [0.05, 0.25]
-
-_LEDUC_RANKS = (1, 2, 3)          # J=1, Q=2, K=3
-_LEDUC_DECK  = (1, 1, 2, 2, 3, 3) # full 6-card deck, card position → rank
-
-
-def _compute_hand_equity(private_rank: int, public_rank: "int | None") -> float:
-    """
-    Compute win-probability (equity) of our private card vs a uniform opponent range.
-
-    Returns float in [0.0, 1.0]:
-      1.0 = always wins (pair is strongest possible hand)
-      0.5 = break-even
-      0.0 = always loses
-    """
-    if public_rank is not None:
-        # Round 2: exact equity given the revealed board card
-        we_have_pair = (private_rank == public_rank)
-        wins = ties = total = 0
-        for opp_rank in _LEDUC_RANKS:
-            copies_in_deck = _LEDUC_DECK.count(opp_rank)
-            removed   = (1 if opp_rank == private_rank else 0) + \
-                        (1 if opp_rank == public_rank  else 0)
-            opp_count = max(0, copies_in_deck - removed)
-            if opp_count == 0:
-                continue
-            opp_has_pair = (opp_rank == public_rank)
-            if we_have_pair and not opp_has_pair:
-                wins += opp_count
-            elif not we_have_pair and opp_has_pair:
-                pass
-            elif private_rank > opp_rank:
-                wins += opp_count
-            elif private_rank < opp_rank:
-                pass
-            else:
-                ties += opp_count
-            total += opp_count
-        if total == 0:
-            return 0.5
-        return (wins + 0.5 * ties) / total
-    else:
-        # Round 1: average equity over all possible public cards
-        total_equity = 0.0
-        board_count  = 0
-        for board_rank in _LEDUC_RANKS:
-            copies_in_deck = _LEDUC_DECK.count(board_rank)
-            blocked_by_us  = 1 if board_rank == private_rank else 0
-            board_copies   = copies_in_deck - blocked_by_us
-            if board_copies <= 0:
-                continue
-            total_equity += _compute_hand_equity(private_rank, board_rank) * board_copies
-            board_count  += board_copies
-        if board_count == 0:
-            return 0.5
-        return total_equity / board_count
-
-
 # REWARD CALCULATOR FOR LEDUC POKER
 
+# Episode-level reward constants (clipped to [-1, 1])
+_TERMINAL_WIN_REWARD     = 1.0
+_TERMINAL_LOSS_REWARD    = -1.0
+_FOLD_PAIR_PENALTY       = -0.15  # folding a pair = surrendering dominant hand
+_FOLD_K_PENALTY          = -0.10  # folding K = surrendering strongest non-pair
+_RAISE_PAIR_R2_BONUS     = 0.10   # raising with pair in R2 = correct aggression
+_TERMINAL_REWARD_CLIP    = 1.0    # hard clip for final episode reward
+
+
 class RewardCalculator:
-    """Shaped reward calculator for Leduc Poker opponent-modeling training."""
+    """
+    Episode-level reward for Leduc Poker.
+    Sparse step penalties (invalid only) + terminal win/loss + strategic bonuses.
+    Clipped to [-1, 1].
+    """
 
-    SIGNALS = {
-        "fold_pair":          -2.0,   # folding a pair = surrendering dominant hand
-        "fold_k":             -1.5,   # folding K = surrendering strongest non-pair
-        "fold_kq_r1_raise":   -1.5,   # folding K or Q to R1 raise = wrong fold
-        "fold_q_pubk_raise":  -0.5,   # folding Q when board=K and opp raised = OK
-        "fold_j_r1_raise":    +0.3,   # folding J to R1 raise = correct (bad pot odds)
-        "fold_j_r2_raise":    +0.2,   # folding J to R2 raise = correct (likely beaten)
-        "fold_q_pubj_raise":  +0.2,   # folding Q when board=J and opp raised = careful
-        "raise_pair_r2":      +0.3,   # raising with pair in R2 = dominant hand aggression
-        "raise_k_r2":         +0.2,   # raising with K in R2 = strong non-pair aggression
-        "call_kq_r1_raise":   +0.2,   # calling with K/Q to R1 raise = correct pot odds
-        # Gap-fill signals
-        "raise_k_r1":         +0.25,  # K in R1 has 70% equity — strongest non-pair; should raise
-        "call_pair_r2_raise":  +0.50,  # Pair vs opp R2 raise: near-certain win (90-100%); must call
-        "raise_q_r2_pubj":    +0.15,  # Q + board=J in R2: Q beats non-pair J (equity 62.5%)
-    }
+    def __init__(self):
+        self.invalid_penalty = _INVALID_PENALTY
 
-    def __init__(self, gamma: float = 0.9):
-        self.gamma = gamma  # 0.9 = standard discount for short LP episodes
+    def calculate_step_reward(self, is_invalid: bool = False) -> float:
+        if is_invalid:
+            return self.invalid_penalty
+        return 0.0
 
-    def calculate_step_reward(
-        self, gs: "GameState | None", action_str: str, env_reward: float
+    def calculate_episode_reward(
+        self,
+        step_rewards: list[float],
+        env_reward: float,
+        done: bool,
+        strategic_bonus: float = 0.0,
     ) -> float:
-        reward = 0.0
+        terminal = 0.0
+        if done:
+            if env_reward > 0:
+                terminal = _TERMINAL_WIN_REWARD + strategic_bonus
+            elif env_reward < 0:
+                terminal = _TERMINAL_LOSS_REWARD
+            # env_reward == 0 (draw/unfinished) → terminal stays 0
 
-        if gs is not None:
-            pub = gs.public_card_rank or 0
+        invalid_total = max(sum(r for r in step_rewards if r < 0), _INVALID_TOTAL_CLIP)
 
-            if action_str == "Fold":
-                if gs.has_pair:
-                    reward += self.SIGNALS["fold_pair"]
-                elif gs.private_card_rank == 3:
-                    reward += self.SIGNALS["fold_k"]
-                elif gs.round == 1 and gs.opp_last_action == "Raise":
-                    reward += (
-                        self.SIGNALS["fold_kq_r1_raise"]
-                        if gs.private_card_rank >= 2
-                        else self.SIGNALS["fold_j_r1_raise"]
-                    )
-                elif gs.round == 2 and gs.opp_last_action == "Raise":
-                    if gs.private_card_rank == 1:
-                        reward += self.SIGNALS["fold_j_r2_raise"]
-                    elif gs.private_card_rank == 2 and pub == 1:
-                        reward += self.SIGNALS["fold_q_pubj_raise"]
-                    elif gs.private_card_rank == 2 and pub == 3:
-                        reward += self.SIGNALS["fold_q_pubk_raise"]
-
-            elif action_str == "Raise":
-                if gs.round == 2 and gs.has_pair:
-                    reward += self.SIGNALS["raise_pair_r2"]
-                elif gs.round == 2 and gs.private_card_rank == 3 and not gs.has_pair:
-                    reward += self.SIGNALS["raise_k_r2"]
-                elif gs.round == 2 and gs.private_card_rank == 2 and pub == 1 and not gs.has_pair:
-                    reward += self.SIGNALS["raise_q_r2_pubj"]
-                elif gs.round == 1 and gs.private_card_rank == 3 and not gs.has_pair:
-                    reward += self.SIGNALS["raise_k_r1"]
-                if gs.has_pair:
-                    reward += 1.5  # extra pair aggression bonus — pair always dominates
-
-            elif action_str in ("Call", "Check"):
-                if gs.round == 1 and gs.opp_last_action == "Raise" and gs.private_card_rank >= 2:
-                    reward += self.SIGNALS["call_kq_r1_raise"]
-                if gs.round == 2 and gs.has_pair and gs.opp_last_action == "Raise":
-                    reward += self.SIGNALS["call_pair_r2_raise"]
-
-        # DeepStack equity bonus (additive — does not replace any SIGNAL)
-        if gs is not None and action_str in ("Raise", "Call", "Check", "Fold"):
-            equity = _compute_hand_equity(gs.private_card_rank, gs.public_card_rank)
-            if action_str == "Raise":
-                reward += _EQUITY_REWARD_SCALE * (equity - 0.5)        # bonus ∝ equity above break-even
-            elif action_str == "Fold":
-                reward -= _EQUITY_REWARD_SCALE * (equity - 0.5)        # penalty for folding high equity
-            else:
-                reward += _EQUITY_REWARD_SCALE * 0.5 * (equity - 0.5) # small signal for call/check
-
-        if env_reward != 0.0:
-            reward += max(min(env_reward * 30.0, 30.0), -30.0)  # scale ×30, clip [-30, 30]
-
-        return reward
-
-    def calculate_discounted_return(self, rewards: list[float]) -> float:
-        if not rewards:
-            return 0.0
-        T = len(rewards)
-        return sum(self.gamma ** (T - 1 - i) * r for i, r in enumerate(rewards))  # γ^(T-1-i)
-
-    def calculate_pot_commitment_bonus(
-        self, gs: "GameState | None", action_str: str
-    ) -> float:
-        """
-        Per-turn intermediate reward based on pot-odds awareness.
-
-        G.O.D environment_tasks.md: 'Finding a way to give the model intermediate
-        reward will greatly improve training.' (default miner gives 0 until game ends)
-        """
-        if gs is None or not action_str:
-            return 0.0
-
-        bonus  = 0.0
-        equity = _compute_hand_equity(gs.private_card_rank, gs.public_card_rank)
-
-        pot_proxy         = max(1, gs.pot) if gs.pot else 2
-        required_fraction = 1.0 / (pot_proxy + 1)  # rough pot-odds fraction
-        surplus           = equity - required_fraction
-
-        if action_str == "Raise":
-            bonus += _INTER_TURN_REWARD_SCALE * max(0.0, surplus)
-        elif action_str == "Fold":
-            bonus += _INTER_TURN_REWARD_SCALE * max(0.0, -surplus)
-        else:
-            bonus += _INTER_TURN_REWARD_SCALE * 0.3 * surplus
-
-        # Extra R2 pair aggression nudge
-        if gs.round == 2 and gs.has_pair and action_str == "Raise":
-            bonus += _INTER_TURN_REWARD_SCALE * 0.5  # 0.15 * 0.5 = 0.075
-
-        # Small bonus for producing any valid action string
-        if action_str in ("Raise", "Call", "Check", "Fold"):
-            bonus += _INTER_TURN_REWARD_SCALE * 0.1  # 0.15 * 0.1 = 0.015
-
-        return bonus
+        raw = terminal + invalid_total
+        return max(min(raw, _TERMINAL_REWARD_CLIP), -_TERMINAL_REWARD_CLIP)
 
 
 # OBSERVATION FORMATTER AND ACTION PARSER FOR LEDUC POKER
@@ -635,9 +489,8 @@ def _run_episode(
     """
     Run one Leduc Poker episode against a fixed MCTS(50, 1) opponent.
 
-    Reward = discounted shaped return (per-step strategy signals + DeepStack
-    equity bonus + inter-turn pot-commitment bonus + terminal env reward ×30)
-    plus episode-level invalid-action penalty (escalating for consecutive invalids).
+    Reward = episode-level terminal win/loss + strategic bonuses + invalid
+    penalties, hard-clipped to [-1, 1].
 
     When use_full_prompt=True, accumulates token IDs across all turns with
     action masking (mask=1 for LLM completions, 0 for env tokens).
@@ -659,17 +512,16 @@ def _run_episode(
     completion_ids: list[int]   = []
     logprobs:       list[float] = []
 
-    done                 = False
-    final_reward         = 0.0
-    episode_reward       = 0.0
-    turn_number          = 0
-    invalid_count        = 0
-    consecutive_invalids = 0  # tracks back-to-back invalids for escalating penalty
-    use_hints            = random.random() < current_hint_prob  # 75%→0% via curriculum
+    done           = False
+    final_reward   = 0.0
+    turn_number    = 0
+    invalid_count  = 0
+    use_hints      = random.random() < current_hint_prob  # 75%→0% via curriculum
 
     game_state_history: list[GameState] = []
     calculator = RewardCalculator()
-    rewards:    list[float] = []
+    rewards:      list[float] = []
+    strategic_bonus = 0.0
 
     # --- Reset environment ---
     reset_payload = {
@@ -781,13 +633,8 @@ def _run_episode(
         )
         if not parse_ok:
             action_to_send = _select_fallback_action(prev_gs)
-            consecutive_invalids += 1
             invalid_count += 1
-            # Escalating penalty: -0.10, -0.15, -0.20, ... (capped at consecutive_invalids)
-            penalty = _INVALID_PENALTY + _CONSEC_INVALID_ESC * max(0, consecutive_invalids - 1)
-            episode_reward += penalty
-        else:
-            consecutive_invalids = 0  # reset on valid action
+            rewards.append(calculator.calculate_step_reward(is_invalid=True))
 
         try:
             step_res = requests.post(
@@ -810,17 +657,18 @@ def _run_episode(
             step_reward = 0
             done        = False
             step_block  = {"reward": 0.0, "done": False}
-            invalid_count  += 1
-            episode_reward += _INVALID_PENALTY
+            invalid_count += 1
+            rewards.append(calculator.calculate_step_reward(is_invalid=True))
 
         if "Nothing happens" in observation or "Invalid" in observation:
-            invalid_count  += 1
-            episode_reward += _INVALID_PENALTY
+            invalid_count += 1
+            rewards.append(calculator.calculate_step_reward(is_invalid=True))
 
         if done:
             # Robust terminal reward extraction (tries multiple server formats)
             final_reward = _extract_terminal_reward(step_block, observation)
 
+        # Track strategic bonus for episode-level reward
         try:
             action_str = (
                 prev_gs.legal_actions.get(int(action_to_send.strip()), "")
@@ -829,14 +677,24 @@ def _run_episode(
         except (ValueError, AttributeError):
             action_str = ""
 
-        step_shaped  = calculator.calculate_step_reward(prev_gs, action_str, step_reward if done else 0.0)
-        inter_turn   = calculator.calculate_pot_commitment_bonus(prev_gs, action_str)
-        rewards.append(step_shaped + inter_turn)
+        if prev_gs is not None and parse_ok:
+            if action_str == "Fold" and prev_gs.has_pair:
+                strategic_bonus += _FOLD_PAIR_PENALTY
+            elif action_str == "Fold" and prev_gs.private_card_rank == 3:
+                strategic_bonus += _FOLD_K_PENALTY
+            elif action_str == "Raise" and prev_gs.round == 2 and prev_gs.has_pair:
+                strategic_bonus += _RAISE_PAIR_R2_BONUS
+
+            rewards.append(calculator.calculate_step_reward(is_invalid=False))
 
         messages.append({"role": "user", "content": observation})
         turn_number += 1
 
-    train_reward = calculator.calculate_discounted_return(rewards) + episode_reward
+    # --- Final reward ---
+    train_reward = calculator.calculate_episode_reward(
+        rewards, final_reward, done,
+        strategic_bonus=strategic_bonus,
+    )
     print(
         "[ID:{:<6} Done:{} T:{:>2d} | Hints:{:<2} | EnvR:{:>6.2f} | "
         "TrainR:{:>6.2f} | Inv:{:<2} | MCTS:{}]".format(
